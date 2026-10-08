@@ -5,22 +5,35 @@ import pino from 'pino';
 import fs from 'node:fs/promises';
 
 const enabled = process.env.WA_ENABLED === 'true';
-if (!enabled) { console.log('[WA] Disabled. Set WA_ENABLED=true after configuring access.'); process.exit(0); }
+if (!enabled) {
+  console.log('[WA] Disabled. Set WA_ENABLED=true after configuring access.');
+  process.exit(0);
+}
+
 const authDir = process.env.WA_AUTH_DIR || '/home/node/.wa_auth';
-const baseURL = process.env.WA_AI_BASE_URL || 'http://127.0.0.1:17070/v1';
+const baseURL = process.env.WA_AI_BASE_URL || ('http://127.0.0.1:' + (process.env.PORT || '17070') + '/v1');
 const apiURL = baseURL.endsWith('/') ? baseURL.slice(0, -1) : baseURL;
 const apiKey = process.env.WA_AI_API_KEY || '';
 const configuredModel = (process.env.WA_MODEL || 'auto').trim();
 let modelCache = { ids: [], expires: 0 };
+
 async function chooseModels() {
-  if (configuredModel && configuredModel.toLowerCase() !== 'auto' && !configuredModel.startsWith('ID model')) return [configuredModel];
+  if (configuredModel && configuredModel.toLowerCase() !== 'auto' && !configuredModel.startsWith('ID model')) {
+    return [configuredModel];
+  }
   if (Date.now() < modelCache.expires) return modelCache.ids;
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 7000);
     let response;
-    try { response = await fetch(apiURL + '/models', { headers: apiKey ? { Authorization: 'Bearer ' + apiKey } : {}, signal: controller.signal }); }
-    finally { clearTimeout(timeout); }
+    try {
+      response = await fetch(apiURL + '/models', {
+        headers: apiKey ? { Authorization: 'Bearer ' + apiKey } : {},
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
     if (!response.ok) throw new Error('Models HTTP ' + response.status);
     const data = await response.json();
     const ids = [...new Set((Array.isArray(data.data) ? data.data : []).map(m => m?.id).filter(id => typeof id === 'string' && id.length < 200))];
@@ -33,26 +46,32 @@ async function chooseModels() {
     return modelCache.ids;
   }
 }
+
 const localFAQ = new Map([
   ['halo', 'Halo! Ada yang bisa saya bantu?'],
   ['hai', 'Halo! Ada yang bisa saya bantu?'],
   ['menu', 'Silakan tulis pertanyaan atau produk yang ingin ditanyakan.']
 ]);
+
 const logger = pino({ level: 'warn' });
 const messageSeen = new Map();
 const userLast = new Map();
 let globalRequests = [];
 let reconnectCount = 0;
-let socket;
-let reconnectTimer;
+let socket = null;
+let reconnectTimer = null;
+const botSentIds = new Set();
+
 const minUserInterval = Math.max(3000, Number(process.env.WA_USER_COOLDOWN_MS || 15000));
 const maxPerMinute = Math.min(60, Math.max(1, Number(process.env.WA_AI_MAX_PER_MINUTE || 30)));
-const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 function cleanup(now) {
   for (const [id, when] of messageSeen) if (now - when > 10 * 60_000) messageSeen.delete(id);
   globalRequests = globalRequests.filter(t => now - t < 60_000);
   for (const [id, when] of userLast) if (now - when > 60 * 60_000) userLast.delete(id);
+  if (botSentIds.size > 2000) botSentIds.clear();
 }
+
 async function answerAI(text, jid) {
   const models = await chooseModels();
   if (!models.length) return 'Terima kasih. Saat ini layanan AI belum tersedia. Mohon tunggu admin.';
@@ -66,14 +85,21 @@ async function answerAI(text, jid) {
         response = await fetch(apiURL + '/chat/completions', {
           method: 'POST',
           headers: { 'content-type': 'application/json', ...(apiKey ? { Authorization: 'Bearer ' + apiKey } : {}) },
-          body: JSON.stringify({ model: selectedModel, stream: false, max_tokens: 250, messages: [
-            { role: 'system', content: process.env.WA_SYSTEM_PROMPT || systemPrompt },
-            ...getSession(jid).history.slice(-6),
-            { role: 'user', content: text }
-          ] }),
+          body: JSON.stringify({
+            model: selectedModel,
+            stream: false,
+            max_tokens: 250,
+            messages: [
+              { role: 'system', content: process.env.WA_SYSTEM_PROMPT || systemPrompt },
+              ...getSession(jid).history.slice(-6),
+              { role: 'user', content: text }
+            ]
+          }),
           signal: controller.signal
         });
-      } finally { clearTimeout(timer); }
+      } finally {
+        clearTimeout(timer);
+      }
       if (response.ok) {
         const data = await response.json();
         const answer = cleanResponse(String(data.choices?.[0]?.message?.content || '')).slice(0, 3500);
@@ -84,28 +110,59 @@ async function answerAI(text, jid) {
         break;
       }
       console.warn('[WA] Model failed:', selectedModel, 'HTTP', response.status);
-    } catch (err) { console.warn('[WA] AI unavailable:', err.message); break; }
+    } catch (err) {
+      console.warn('[WA] AI unavailable:', err.message);
+      break;
+    }
   }
   return 'Terima kasih. Saat ini asisten AI sedang sibuk. Silakan coba lagi nanti atau tunggu admin.';
 }
+
 async function start() {
+  if (socket) {
+    try {
+      socket.ev?.removeAllListeners();
+      socket.ws?.close();
+    } catch {}
+    socket = null;
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
-  socket = makeWASocket({ version, auth: state, logger, printQRInTerminal: false, syncFullHistory: false, markOnlineOnConnect: false });
+  
+  socket = makeWASocket({
+    version,
+    auth: state,
+    logger,
+    printQRInTerminal: false,
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    fireInitQueries: false,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 25000
+  });
+
   socket.ev.on('creds.update', saveCreds);
+
   const phone = String(process.env.WA_PHONE_NUMBER || '').replace(/[^0-9]/g, '');
-  if (!state.creds.registered && phone) {
+  if (!state.creds?.registered && phone) {
     setTimeout(async () => {
       try {
         const code = await socket.requestPairingCode(phone);
         console.log('[WA] Pairing code (do not share publicly):', code);
         console.log('[WA] On WhatsApp: Linked devices > Link with phone number instead.');
-      } catch (err) { console.warn('[WA] Pairing failed:', err.message); }
+      } catch (err) {
+        console.warn('[WA] Pairing failed:', err.message);
+      }
     }, 3000);
   }
+
   socket.ev.on('connection.update', ({ connection, qr, lastDisconnect }) => {
-    if (qr) console.log('[WA] QR pairing baru tersedia. Untuk keamanan, tidak ditampilkan melalui endpoint publik. Gunakan alur pairing lokal atau panel privat.');
-    if (connection === 'open') { reconnectCount = 0; console.log('[WA] WhatsApp connected'); }
+    if (qr) console.log('[WA] QR pairing baru tersedia. Untuk keamanan, tidak ditampilkan melalui endpoint publik.');
+    if (connection === 'open') {
+      reconnectCount = 0;
+      console.log('[WA] WhatsApp connected & listening for messages');
+    }
     if (connection === 'close') {
       const reason = lastDisconnect?.error?.output?.statusCode;
       if (reason === DisconnectReason.loggedOut) {
@@ -114,47 +171,81 @@ async function start() {
       }
       reconnectCount++;
       const backoff = Math.min(300000, 5000 * Math.pow(2, Math.min(reconnectCount, 6)));
-      console.warn('[WA] Connection closed; reconnecting with backoff (ms):', backoff);
+      console.warn('[WA] Connection closed (' + reason + '); reconnecting with backoff (ms):', backoff);
       clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(start, backoff);
     }
   });
+
   socket.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
     for (const msg of messages || []) {
       try {
         const jid = msg.key?.remoteJid || '';
-        if (!jid.endsWith('@s.whatsapp.net') || msg.key?.fromMe) continue;
+        if (!jid || !jid.endsWith('@s.whatsapp.net')) continue;
+
+        // Cegah bot membalas pesannya sendiri
+        if (msg.key?.id && botSentIds.has(msg.key.id)) continue;
+
+        const myPhone = String(process.env.WA_PHONE_NUMBER || '').replace(/[^0-9]/g, '');
+        const jidNum = jid.split('@')[0].split(':')[0];
+        const isSelfChat = Boolean(myPhone && jidNum === myPhone);
+
+        // Jika fromMe tapi bukan self-chat ke nomor sendiri (misal owner chat manual ke orang lain), jangan balas
+        if (msg.key?.fromMe && !isSelfChat) continue;
+
         const id = jid + ':' + (msg.key?.id || '');
         const now = Date.now();
         cleanup(now);
         if (!msg.key?.id || messageSeen.has(id)) continue;
         messageSeen.set(id, now);
-        const body = (msg.message?.conversation || msg.message?.extendedTextMessage?.text || '').trim();
+
+        const m = msg.message?.ephemeralMessage?.message 
+               || msg.message?.viewOnceMessage?.message 
+               || msg.message?.documentWithCaptionMessage?.message
+               || msg.message;
+        const body = (m?.conversation || m?.extendedTextMessage?.text || m?.imageMessage?.caption || '').trim();
         if (!body) continue;
         const text = body.slice(0, 1500);
+
+        console.log(`[WA] Pesan masuk dari ${jid}: "${text}"`);
+
         if (/^\/(reset|hapus|mulaiulang)$/i.test(text)) {
           resetSession(jid);
-          await socket.sendMessage(jid, {text:'Riwayat percakapan Nadia sudah direset, kak.'});
+          const sent = await socket.sendMessage(jid, { text: 'Riwayat percakapan Nadia sudah direset, kak.' });
+          if (sent?.key?.id) botSentIds.add(sent.key.id);
           continue;
         }
+
         if (/^(\/qris|qris|qr code|barcode pembayaran|bayar qris)$/i.test(text) || /(?:minta|kirim|lihat|mau|bayar).*qris/i.test(text)) {
           const qrURL = process.env.WA_QRIS_IMAGE_URL || 'https://raw.githubusercontent.com/NourAnisa/bansos-router-snapdeploy/main/qris_bit_bean.png';
           try {
-            await socket.sendMessage(jid, {image:{url:qrURL}, caption:'QRIS Bit & Bean (NMID: ID1025428743757). Setelah membayar, kirim bukti agar admin dapat memverifikasi. Pembayaran tidak diverifikasi otomatis.'});
+            const sent = await socket.sendMessage(jid, {
+              image: { url: qrURL },
+              caption: 'QRIS Bit & Bean (NMID: ID1025428743757). Setelah membayar, kirim bukti agar admin dapat memverifikasi. Pembayaran tidak diverifikasi otomatis.'
+            });
+            if (sent?.key?.id) botSentIds.add(sent.key.id);
           } catch (err) {
-            console.warn('[WA] QRIS image failed:',err.message);
-            await socket.sendMessage(jid,{text:'QRIS Bit & Bean: '+qrURL+'\nSilakan konfirmasi pembayaran kepada admin.'});
+            console.warn('[WA] QRIS image failed:', err.message);
+            const sent = await socket.sendMessage(jid, {
+              text: 'QRIS Bit & Bean: ' + qrURL + '\nSilakan konfirmasi pembayaran kepada admin.'
+            });
+            if (sent?.key?.id) botSentIds.add(sent.key.id);
           }
           continue;
         }
+
         if (/^\/rekening$|\b(rekening|norek|nomor rekening|transfer bank)\b/i.test(text)) {
-          await socket.sendMessage(jid,{text:'Pembayaran transfer bank untuk tiga usaha perlu diverifikasi admin. Hubungi admin sebelum transfer untuk memastikan nomor rekening tujuan yang berlaku.'});
+          const sent = await socket.sendMessage(jid, {
+            text: 'Pembayaran transfer bank untuk tiga unit usaha:\n- BNI: 1048491406\n- SeaBank: 901187631820\n- BTN: 1001501017745\na.n. Nor Anisa.\n\nHarap kirimkan bukti transfer ke sini untuk konfirmasi admin ya kak.'
+          });
+          if (sent?.key?.id) botSentIds.add(sent.key.id);
           continue;
         }
+
         const business = businessFAQ(text, jid);
         const faq = business?.reply || localFAQ.get(text.toLowerCase());
         let reply = faq;
+
         if (!reply) {
           if (now - (userLast.get(jid) || 0) < minUserInterval) continue;
           if (globalRequests.length >= maxPerMinute) {
@@ -165,10 +256,23 @@ async function start() {
             reply = await answerAI(text, jid);
           }
         }
-        if (reply) { addMessage(jid,'user',text); addMessage(jid,'assistant',reply); await socket.sendMessage(jid, { text: reply }); }
-      } catch (err) { console.warn('[WA] Message handler error:', err.message); }
+
+        if (reply) {
+          addMessage(jid, 'user', text);
+          addMessage(jid, 'assistant', reply);
+          console.log(`[WA] Mengirim balasan ke ${jid}: "${reply.slice(0, 60)}..."`);
+          const sent = await socket.sendMessage(jid, { text: reply });
+          if (sent?.key?.id) botSentIds.add(sent.key.id);
+        }
+      } catch (err) {
+        console.warn('[WA] Message handler error:', err.message);
+      }
     }
   });
 }
+
 await fs.mkdir(authDir, { recursive: true });
-start().catch(err => { console.error('[WA] Startup failed:', err.message); process.exitCode = 1; });
+start().catch(err => {
+  console.error('[WA] Startup failed:', err.message);
+  process.exitCode = 1;
+});
