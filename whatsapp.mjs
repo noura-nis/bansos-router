@@ -3,6 +3,7 @@ import { businessFAQ, getContextualFallback, systemPrompt } from './nadia-busine
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import fs from 'node:fs/promises';
+import path from 'node:path';
 
 const enabled = process.env.WA_ENABLED === 'true';
 if (!enabled) {
@@ -16,6 +17,93 @@ const apiURL = baseURL.endsWith('/') ? baseURL.slice(0, -1) : baseURL;
 const apiKey = process.env.WA_AI_API_KEY || '';
 const configuredModel = (process.env.WA_MODEL || 'auto').trim();
 let modelCache = { ids: [], expires: 0 };
+
+const AUTH_SYNC_URL = process.env.WA_AUTH_SYNC_URL || 'https://nourastudio.co-id.id/sync_wa_auth.php';
+const AUTH_SYNC_TOKEN = process.env.WA_AUTH_SYNC_TOKEN || 'noranisa_content_secret_2026';
+
+// 1. AUTO-RESTORE SESI DARI CLOUD HOSTING (nourastudio.co-id.id)
+async function restoreSessionFromCloud() {
+  try {
+    const credsPath = path.join(authDir, 'creds.json');
+    try {
+      await fs.access(credsPath);
+      console.log('[WA Auth] Sesi lokal sudah ada di disk.');
+      return true;
+    } catch {}
+
+    console.log('[WA Auth] 🔄 Mengambil sesi WhatsApp tersimpan dari Cloud Hosting (nourastudio.co-id.id)...');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    let res;
+    try {
+      res = await fetch(`${AUTH_SYNC_URL}?token=${AUTH_SYNC_TOKEN}`, {
+        headers: { 'User-Agent': 'Mozilla/5.0', 'X-Token': AUTH_SYNC_TOKEN },
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.files && Object.keys(data.files).length > 0) {
+        await fs.mkdir(authDir, { recursive: true });
+        let count = 0;
+        for (const [fname, b64] of Object.entries(data.files)) {
+          if (fname.endsWith('.json')) {
+            await fs.writeFile(path.join(authDir, fname), Buffer.from(b64, 'base64'));
+            count++;
+          }
+        }
+        console.log(`[WA Auth] ✅ Berhasil restore ${count} file sesi dari Cloud Hosting!`);
+        return true;
+      }
+    }
+  } catch (e) {
+    console.warn('[WA Auth] Belum ada backup sesi di Cloud atau gagal restore:', e.message);
+  }
+  return false;
+}
+
+// 2. AUTO-BACKUP SESI KE CLOUD HOSTING (nourastudio.co-id.id)
+let backupDebounce = null;
+function backupSessionToCloud() {
+  clearTimeout(backupDebounce);
+  backupDebounce = setTimeout(async () => {
+    try {
+      const credsPath = path.join(authDir, 'creds.json');
+      try {
+        await fs.access(credsPath);
+      } catch {
+        return;
+      }
+
+      const fileList = await fs.readdir(authDir);
+      const files = {};
+      for (const fname of fileList) {
+        if (fname.endsWith('.json')) {
+          const full = path.join(authDir, fname);
+          const buf = await fs.readFile(full);
+          files[fname] = buf.toString('base64');
+        }
+      }
+
+      console.log(`[WA Auth] 💾 Menyimpan ${Object.keys(files).length} file sesi ke nourastudio.co-id.id...`);
+      await fetch(AUTH_SYNC_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0',
+          'X-Token': AUTH_SYNC_TOKEN
+        },
+        body: JSON.stringify({ token: AUTH_SYNC_TOKEN, files })
+      });
+      console.log('[WA Auth] ✅ Sesi WhatsApp berhasil disimpan PERMANEN di Cloud Hosting!');
+    } catch (e) {
+      console.warn('[WA Auth] Gagal backup sesi ke Cloud:', e.message);
+    }
+  }, 4000);
+}
 
 async function chooseModels() {
   if (configuredModel && configuredModel.toLowerCase() !== 'auto' && !configuredModel.startsWith('ID model')) {
@@ -122,7 +210,6 @@ async function answerAI(text, jid) {
       console.warn('[WA] AI attempt error:', err.message);
     }
   }
-  // Smart contextual fallback instead of generic busy message
   return getContextualFallback(jid);
 }
 
@@ -134,6 +221,9 @@ async function start() {
     } catch {}
     socket = null;
   }
+
+  await fs.mkdir(authDir, { recursive: true });
+  await restoreSessionFromCloud();
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
@@ -150,7 +240,10 @@ async function start() {
     keepAliveIntervalMs: 25000
   });
 
-  socket.ev.on('creds.update', saveCreds);
+  socket.ev.on('creds.update', async () => {
+    await saveCreds();
+    backupSessionToCloud();
+  });
 
   const phone = String(process.env.WA_PHONE_NUMBER || '').replace(/[^0-9]/g, '');
   if (!state.creds?.registered && phone) {
@@ -170,6 +263,7 @@ async function start() {
     if (connection === 'open') {
       reconnectCount = 0;
       console.log('[WA] WhatsApp connected & listening for messages');
+      backupSessionToCloud();
     }
     if (connection === 'close') {
       const reason = lastDisconnect?.error?.output?.statusCode;
@@ -289,7 +383,6 @@ async function start() {
   });
 }
 
-await fs.mkdir(authDir, { recursive: true });
 start().catch(err => {
   console.error('[WA] Startup failed:', err.message);
   process.exitCode = 1;
