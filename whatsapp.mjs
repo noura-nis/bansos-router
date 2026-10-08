@@ -53,7 +53,7 @@ const localFAQ = new Map([
   ['menu', 'Silakan tulis pertanyaan atau produk yang ingin ditanyakan.']
 ]);
 
-const logger = pino({ level: 'warn' });
+const logger = pino({ level: 'silent' });
 const messageSeen = new Map();
 const userLast = new Map();
 let globalRequests = [];
