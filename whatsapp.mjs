@@ -4,6 +4,10 @@ import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaile
 import pino from 'pino';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const enabled = process.env.WA_ENABLED === 'true';
 if (!enabled) {
@@ -21,17 +25,32 @@ let modelCache = { ids: [], expires: 0 };
 const AUTH_SYNC_URL = process.env.WA_AUTH_SYNC_URL || 'https://nourastudio.co-id.id/sync_wa_auth.php';
 const AUTH_SYNC_TOKEN = process.env.WA_AUTH_SYNC_TOKEN || 'noranisa_content_secret_2026';
 
+// Helper status sync untuk web dashboard /wa
+async function updateStatus(data) {
+  try {
+    const statusFile = path.join(__dirname, 'wa-status.json');
+    await fs.writeFile(statusFile, JSON.stringify({
+      ...data,
+      phone: process.env.WA_PHONE_NUMBER || '6285155133070',
+      timestamp: new Date().toISOString()
+    }, null, 2));
+  } catch {}
+}
+
 // 1. AUTO-RESTORE SESI DARI CLOUD HOSTING (nourastudio.co-id.id)
 async function restoreSessionFromCloud() {
   try {
     const credsPath = path.join(authDir, 'creds.json');
     try {
-      await fs.access(credsPath);
-      console.log('[WA Auth] Sesi lokal sudah ada di disk.');
-      return true;
+      const raw = await fs.readFile(credsPath, 'utf8');
+      const creds = JSON.parse(raw);
+      if (creds && creds.registered) {
+        console.log('[WA Auth] Sesi lokal valid sudah ada di disk.');
+        return true;
+      }
     } catch {}
 
-    console.log('[WA Auth] 🔄 Mengambil sesi WhatsApp tersimpan dari Cloud Hosting (nourastudio.co-id.id)...');
+    console.log('[WA Auth] 🔄 Memeriksa backup sesi WhatsApp di Cloud Hosting (nourastudio.co-id.id)...');
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
     let res;
@@ -46,7 +65,17 @@ async function restoreSessionFromCloud() {
 
     if (res.ok) {
       const data = await res.json();
-      if (data && data.files && Object.keys(data.files).length > 0) {
+      if (data && data.files && data.files['creds.json']) {
+        let creds = null;
+        try {
+          creds = JSON.parse(Buffer.from(data.files['creds.json'], 'base64').toString('utf8'));
+        } catch {}
+
+        if (!creds || !creds.registered) {
+          console.log('[WA Auth] Sesi di Cloud Hosting belum registered. Melewati restore agar direktori auth bersih.');
+          return false;
+        }
+
         await fs.mkdir(authDir, { recursive: true });
         let count = 0;
         for (const [fname, b64] of Object.entries(data.files)) {
@@ -55,12 +84,12 @@ async function restoreSessionFromCloud() {
             count++;
           }
         }
-        console.log(`[WA Auth] ✅ Berhasil restore ${count} file sesi dari Cloud Hosting!`);
+        console.log(`[WA Auth] ✅ Berhasil restore ${count} file sesi valid dari Cloud Hosting!`);
         return true;
       }
     }
   } catch (e) {
-    console.warn('[WA Auth] Belum ada backup sesi di Cloud atau gagal restore:', e.message);
+    console.warn('[WA Auth] Belum ada backup sesi terdaftar di Cloud:', e.message);
   }
   return false;
 }
@@ -72,8 +101,14 @@ function backupSessionToCloud() {
   backupDebounce = setTimeout(async () => {
     try {
       const credsPath = path.join(authDir, 'creds.json');
+      let creds = null;
       try {
-        await fs.access(credsPath);
+        const raw = await fs.readFile(credsPath, 'utf8');
+        creds = JSON.parse(raw);
+        if (!creds || !creds.registered) {
+          console.log('[WA Auth] Sesi belum registered, melewati backup ke Cloud.');
+          return;
+        }
       } catch {
         return;
       }
@@ -150,7 +185,7 @@ async function chooseModels() {
 const localFAQ = new Map([
   ['halo', 'Halo! Ada yang bisa saya bantu?'],
   ['hai', 'Halo! Ada yang bisa saya bantu?'],
-  ['menu', 'Silakan tulis pertanyaan atau produk yang ingin ditanyakan.']
+  ['menu', 'Silakan balas angka 1 (Refill Gas), 2 (Bimbingan Skripsi IT Noura Studio), atau 3 (Bit & Bean Coffee) yaa kak.']
 ]);
 
 const logger = pino({ level: 'silent' });
@@ -162,7 +197,7 @@ let socket = null;
 let reconnectTimer = null;
 const botSentIds = new Set();
 
-const minUserInterval = Math.max(2000, Number(process.env.WA_USER_COOLDOWN_MS || 5000));
+const minUserInterval = Math.max(500, Number(process.env.WA_USER_COOLDOWN_MS || 1000));
 const maxPerMinute = Math.min(60, Math.max(1, Number(process.env.WA_AI_MAX_PER_MINUTE || 30)));
 
 function cleanup(now) {
@@ -222,8 +257,29 @@ async function start() {
     socket = null;
   }
 
+  // 1. Cek sesi lokal vs cloud
+  let hasValidSession = false;
+  try {
+    const credsPath = path.join(authDir, 'creds.json');
+    const raw = await fs.readFile(credsPath, 'utf8');
+    const creds = JSON.parse(raw);
+    if (creds && creds.registered) hasValidSession = true;
+  } catch {}
+
+  if (!hasValidSession) {
+    hasValidSession = await restoreSessionFromCloud();
+  }
+
+  // Jika belum ada sesi valid yang terdaftar, bersihkan authDir agar pairing baru tidak crash
+  if (!hasValidSession) {
+    console.log('[WA Auth] Membersihkan direktori auth untuk request pairing code bersih...');
+    try {
+      await fs.rm(authDir, { recursive: true, force: true });
+    } catch {}
+    await updateStatus({ status: 'initializing' });
+  }
+
   await fs.mkdir(authDir, { recursive: true });
-  await restoreSessionFromCloud();
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
@@ -242,38 +298,54 @@ async function start() {
 
   socket.ev.on('creds.update', async () => {
     await saveCreds();
-    backupSessionToCloud();
+    if (state.creds?.registered) {
+      backupSessionToCloud();
+    }
   });
 
   const phone = String(process.env.WA_PHONE_NUMBER || '').replace(/[^0-9]/g, '');
   if (!state.creds?.registered && phone) {
     setTimeout(async () => {
       try {
-        const code = await socket.requestPairingCode(phone);
-        console.log('[WA] Pairing code (do not share publicly):', code);
-        console.log('[WA] On WhatsApp: Linked devices > Link with phone number instead.');
+        const rawCode = await socket.requestPairingCode(phone);
+        const code = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
+        console.log('\n============================================================');
+        console.log(`[WA] 🔥 KODE PAIRING WHATSAPP: ${code}`);
+        console.log(`[WA] Buka WhatsApp di HP (${phone}) -> Perangkat Tertaut -> Tautkan dengan nomor telepon`);
+        console.log(`[WA] Masukkan kode pairing di atas!`);
+        console.log('============================================================\n');
+        await updateStatus({ status: 'pairing', code });
       } catch (err) {
-        console.warn('[WA] Pairing failed:', err.message);
+        console.warn('[WA] Request pairing code gagal:', err.message);
       }
     }, 3000);
   }
 
-  socket.ev.on('connection.update', ({ connection, qr, lastDisconnect }) => {
-    if (qr) console.log('[WA] QR pairing baru tersedia. Untuk keamanan, tidak ditampilkan melalui endpoint publik.');
+  socket.ev.on('connection.update', async ({ connection, qr, lastDisconnect }) => {
+    if (qr) console.log('[WA] QR pairing tersedia.');
     if (connection === 'open') {
       reconnectCount = 0;
-      console.log('[WA] WhatsApp connected & listening for messages');
+      console.log('\n============================================================');
+      console.log('[WA] 🎉 WHATSAPP BERHASIL TERHUBUNG & SIAP MENERIMA PESAN!');
+      console.log('============================================================\n');
+      await updateStatus({ status: 'connected' });
       backupSessionToCloud();
     }
     if (connection === 'close') {
       const reason = lastDisconnect?.error?.output?.statusCode;
       if (reason === DisconnectReason.loggedOut) {
-        console.error('[WA] Logged out. Re-pairing required; restore or remove stale auth data manually.');
+        console.error('[WA] Sesi WhatsApp logged out (401). Membersihkan sesi lokal...');
+        try {
+          await fs.rm(authDir, { recursive: true, force: true });
+        } catch {}
+        await updateStatus({ status: 'logged_out' });
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(start, 3000);
         return;
       }
       reconnectCount++;
-      const backoff = Math.min(300000, 5000 * Math.pow(2, Math.min(reconnectCount, 6)));
-      console.warn('[WA] Connection closed (' + reason + '); reconnecting with backoff (ms):', backoff);
+      const backoff = Math.min(60000, 3000 * Math.pow(2, Math.min(reconnectCount, 4)));
+      console.warn('[WA] Koneksi terputus (' + reason + '); menghubungkan kembali dalam ' + backoff + 'ms...');
       clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(start, backoff);
     }
@@ -311,31 +383,35 @@ async function start() {
                || msg.message;
         const body = (m?.conversation || m?.extendedTextMessage?.text || m?.imageMessage?.caption || '').trim();
         if (!body) continue;
-        const text = body.slice(0, 1500);
+        const text = body.slice(1500); // safety slice
+        const safeText = body.slice(0, 1500);
 
-        console.log(`[WA] Memproses pesan dari ${jid}: "${text}"`);
+        console.log(`[WA Chat] Pesan masuk dari ${jid}: "${safeText}"`);
+
+        // Target tujuan pengiriman balasan (normalisir @lid ke nomor sendiri jika self-chat)
+        const targetJid = jid.endsWith('@lid') && myPhone ? `${myPhone}@s.whatsapp.net` : jid;
 
         // Handler perintah reset
-        if (/^\/(reset|hapus|mulaiulang)$/i.test(text)) {
+        if (/^\/(reset|hapus|mulaiulang)$/i.test(safeText)) {
           resetSession(jid);
-          const sent = await socket.sendMessage(jid, { text: 'Riwayat percakapan Nadia sudah direset, kak.' });
+          const sent = await socket.sendMessage(targetJid, { text: 'Riwayat percakapan Nadia sudah direset, kak.' });
           if (sent?.key?.id) botSentIds.add(sent.key.id);
           continue;
         }
 
         // Handler QRIS
-        if (/^(\/qris|qris|qr code|barcode pembayaran|bayar qris)$/i.test(text) || /(?:minta|kirim|lihat|mau|bayar).*qris/i.test(text)) {
+        if (/^(\/qris|qris|qr code|barcode pembayaran|bayar qris)$/i.test(safeText) || /(?:minta|kirim|lihat|mau|bayar).*qris/i.test(safeText)) {
           const qrURL = process.env.WA_QRIS_IMAGE_URL || 'https://raw.githubusercontent.com/NourAnisa/bansos-router-snapdeploy/main/qris_bit_bean.png';
           try {
-            const sent = await socket.sendMessage(jid, {
+            const sent = await socket.sendMessage(targetJid, {
               image: { url: qrURL },
-              caption: 'QRIS Bit & Bean (NMID: ID1025428743757). Setelah membayar, kirim bukti agar admin dapat memverifikasi. Pembayaran tidak diverifikasi otomatis.'
+              caption: 'QRIS Bit & Bean (NMID: ID1025428743757). Setelah membayar, kirim bukti transfer/pembayaran agar admin dapat memverifikasi yaa kak 😊'
             });
             if (sent?.key?.id) botSentIds.add(sent.key.id);
           } catch (err) {
             console.warn('[WA] QRIS image failed:', err.message);
-            const sent = await socket.sendMessage(jid, {
-              text: 'QRIS Bit & Bean: ' + qrURL + '\nSilakan konfirmasi pembayaran kepada admin.'
+            const sent = await socket.sendMessage(targetJid, {
+              text: 'QRIS Bit & Bean: ' + qrURL + '\nSilakan kirim bukti pembayaran kepada admin yaa kak.'
             });
             if (sent?.key?.id) botSentIds.add(sent.key.id);
           }
@@ -343,16 +419,16 @@ async function start() {
         }
 
         // Handler Rekening
-        if (/^\/rekening$|\b(rekening|norek|nomor rekening|transfer bank)\b/i.test(text)) {
-          const sent = await socket.sendMessage(jid, {
-            text: 'Pembayaran transfer bank untuk tiga unit usaha:\n- BNI: 1048491406\n- SeaBank: 901187631820\n- BTN: 1001501017745\na.n. Nor Anisa.\n\nHarap kirimkan bukti transfer ke sini untuk konfirmasi admin ya kak.'
+        if (/^\/rekening$|\b(rekening|norek|nomor rekening|transfer bank)\b/i.test(safeText)) {
+          const sent = await socket.sendMessage(targetJid, {
+            text: 'Pembayaran transfer bank untuk tiga unit usaha:\n- BNI: 1048491406\n- SeaBank: 901187631820\n- BTN: 1001501017745\na.n. Nor Anisa.\n\nHarap kirimkan bukti transfer ke sini untuk konfirmasi admin ya kak 😊'
           });
           if (sent?.key?.id) botSentIds.add(sent.key.id);
           continue;
         }
 
-        const business = businessFAQ(text, jid);
-        const faq = business?.reply || localFAQ.get(text.toLowerCase());
+        const business = businessFAQ(safeText, jid);
+        const faq = business?.reply || localFAQ.get(safeText.toLowerCase());
         let reply = faq;
 
         if (!reply) {
@@ -361,19 +437,19 @@ async function start() {
             continue;
           }
           if (globalRequests.length >= maxPerMinute) {
-            reply = 'Pesan sedang ramai. Silakan tunggu sebentar dan kirim kembali nanti.';
+            reply = 'Pesan sedang ramai. Silakan tunggu sebentar dan kirim kembali nanti yaa kak.';
           } else {
             userLast.set(jid, now);
             globalRequests.push(now);
-            reply = await answerAI(text, jid);
+            reply = await answerAI(safeText, jid);
           }
         }
 
         if (reply) {
-          addMessage(jid, 'user', text);
+          addMessage(jid, 'user', safeText);
           addMessage(jid, 'assistant', reply);
-          console.log(`[WA] Mengirim balasan ke ${jid}: "${reply.slice(0, 60)}..."`);
-          const sent = await socket.sendMessage(jid, { text: reply });
+          console.log(`[WA Chat] Balasan dikirim ke ${targetJid}: "${reply.slice(0, 60)}..."`);
+          const sent = await socket.sendMessage(targetJid, { text: reply });
           if (sent?.key?.id) botSentIds.add(sent.key.id);
         }
       } catch (err) {
