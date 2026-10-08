@@ -1,5 +1,5 @@
 import { getSession, addMessage, resetSession, cleanResponse } from './nadia-session.mjs';
-import { businessFAQ, systemPrompt } from './nadia-business.mjs';
+import { businessFAQ, getContextualFallback, systemPrompt } from './nadia-business.mjs';
 import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import fs from 'node:fs/promises';
@@ -21,7 +21,7 @@ async function chooseModels() {
   if (configuredModel && configuredModel.toLowerCase() !== 'auto' && !configuredModel.startsWith('ID model')) {
     return [configuredModel];
   }
-  if (Date.now() < modelCache.expires) return modelCache.ids;
+  if (Date.now() < modelCache.expires && modelCache.ids.length > 0) return modelCache.ids;
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 7000);
@@ -36,7 +36,19 @@ async function chooseModels() {
     }
     if (!response.ok) throw new Error('Models HTTP ' + response.status);
     const data = await response.json();
-    const ids = [...new Set((Array.isArray(data.data) ? data.data : []).map(m => m?.id).filter(id => typeof id === 'string' && id.length < 200))];
+    let ids = [...new Set((Array.isArray(data.data) ? data.data : []).map(m => m?.id).filter(id => typeof id === 'string' && id.length < 200))];
+
+    // Filter out models known to return 400
+    ids = ids.filter(id => !id.includes('ling-3.0'));
+
+    // Prioritize fast, reliable models
+    const priority = ['mimo', 'nemotron', 'deepseek', 'codestral', 'fast', 'default'];
+    ids.sort((a, b) => {
+      const pa = priority.findIndex(p => a.toLowerCase().includes(p));
+      const pb = priority.findIndex(p => b.toLowerCase().includes(p));
+      return (pa === -1 ? 99 : pa) - (pb === -1 ? 99 : pb);
+    });
+
     modelCache = { ids, expires: Date.now() + (ids.length ? 10 * 60_000 : 60_000) };
     console.log('[WA] Auto model catalog:', ids.length, 'model IDs cached');
     return ids;
@@ -62,7 +74,7 @@ let socket = null;
 let reconnectTimer = null;
 const botSentIds = new Set();
 
-const minUserInterval = Math.max(3000, Number(process.env.WA_USER_COOLDOWN_MS || 15000));
+const minUserInterval = Math.max(2000, Number(process.env.WA_USER_COOLDOWN_MS || 5000));
 const maxPerMinute = Math.min(60, Math.max(1, Number(process.env.WA_AI_MAX_PER_MINUTE || 30)));
 
 function cleanup(now) {
@@ -74,12 +86,11 @@ function cleanup(now) {
 
 async function answerAI(text, jid) {
   const models = await chooseModels();
-  if (!models.length) return 'Terima kasih. Saat ini layanan AI belum tersedia. Mohon tunggu admin.';
-  for (let attempt = 0; attempt < Math.min(models.length, 2); attempt++) {
+  for (let attempt = 0; attempt < Math.min(models.length, 3); attempt++) {
     const selectedModel = models[attempt];
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 22000);
+      const timer = setTimeout(() => controller.abort(), 18000);
       let response;
       try {
         response = await fetch(apiURL + '/chat/completions', {
@@ -88,7 +99,7 @@ async function answerAI(text, jid) {
           body: JSON.stringify({
             model: selectedModel,
             stream: false,
-            max_tokens: 250,
+            max_tokens: 800,
             messages: [
               { role: 'system', content: process.env.WA_SYSTEM_PROMPT || systemPrompt },
               ...getSession(jid).history.slice(-6),
@@ -102,20 +113,17 @@ async function answerAI(text, jid) {
       }
       if (response.ok) {
         const data = await response.json();
-        const answer = cleanResponse(String(data.choices?.[0]?.message?.content || '')).slice(0, 3500);
+        const rawContent = String(data.choices?.[0]?.message?.content || '');
+        const answer = cleanResponse(rawContent).slice(0, 3500);
         if (answer) return answer;
       }
-      if (response.status === 429) {
-        console.warn('[WA] Rate-limited by AI endpoint. No immediate retry.');
-        break;
-      }
-      console.warn('[WA] Model failed:', selectedModel, 'HTTP', response.status);
+      console.warn('[WA] Model fallback:', selectedModel, 'status', response?.status);
     } catch (err) {
-      console.warn('[WA] AI unavailable:', err.message);
-      break;
+      console.warn('[WA] AI attempt error:', err.message);
     }
   }
-  return 'Terima kasih. Saat ini asisten AI sedang sibuk. Silakan coba lagi nanti atau tunggu admin.';
+  // Smart contextual fallback instead of generic busy message
+  return getContextualFallback(jid);
 }
 
 async function start() {
@@ -186,8 +194,6 @@ async function start() {
         // Skip status broadcast & newsletter channels
         if (jid === 'status@broadcast' || jid.endsWith('@newsletter')) continue;
 
-        console.log(`[WA] Pesan diterima (type: ${type}): id=${msg.key?.id} fromMe=${msg.key?.fromMe} jid=${jid}`);
-
         // Jangan balas pesan yang dikirim oleh bot sendiri
         if (msg.key?.id && botSentIds.has(msg.key.id)) continue;
 
@@ -210,14 +216,12 @@ async function start() {
                || msg.message?.documentWithCaptionMessage?.message
                || msg.message;
         const body = (m?.conversation || m?.extendedTextMessage?.text || m?.imageMessage?.caption || '').trim();
-        if (!body) {
-          console.log(`[WA] Pesan tanpa teks diabaikan dari ${jid}`);
-          continue;
-        }
+        if (!body) continue;
         const text = body.slice(0, 1500);
 
         console.log(`[WA] Memproses pesan dari ${jid}: "${text}"`);
 
+        // Handler perintah reset
         if (/^\/(reset|hapus|mulaiulang)$/i.test(text)) {
           resetSession(jid);
           const sent = await socket.sendMessage(jid, { text: 'Riwayat percakapan Nadia sudah direset, kak.' });
@@ -225,6 +229,7 @@ async function start() {
           continue;
         }
 
+        // Handler QRIS
         if (/^(\/qris|qris|qr code|barcode pembayaran|bayar qris)$/i.test(text) || /(?:minta|kirim|lihat|mau|bayar).*qris/i.test(text)) {
           const qrURL = process.env.WA_QRIS_IMAGE_URL || 'https://raw.githubusercontent.com/NourAnisa/bansos-router-snapdeploy/main/qris_bit_bean.png';
           try {
@@ -243,6 +248,7 @@ async function start() {
           continue;
         }
 
+        // Handler Rekening
         if (/^\/rekening$|\b(rekening|norek|nomor rekening|transfer bank)\b/i.test(text)) {
           const sent = await socket.sendMessage(jid, {
             text: 'Pembayaran transfer bank untuk tiga unit usaha:\n- BNI: 1048491406\n- SeaBank: 901187631820\n- BTN: 1001501017745\na.n. Nor Anisa.\n\nHarap kirimkan bukti transfer ke sini untuk konfirmasi admin ya kak.'
@@ -257,7 +263,7 @@ async function start() {
 
         if (!reply) {
           if (now - (userLast.get(jid) || 0) < minUserInterval) {
-            console.log(`[WA] Cooldown aktif untuk ${jid}, lewati`);
+            console.log(`[WA] Cooldown singkat untuk ${jid}`);
             continue;
           }
           if (globalRequests.length >= maxPerMinute) {
