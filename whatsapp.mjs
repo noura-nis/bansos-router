@@ -365,10 +365,17 @@ async function start() {
 
         const myPhone = String(process.env.WA_PHONE_NUMBER || '').replace(/[^0-9]/g, '');
         const myJidNum = socket.user?.id ? socket.user.id.split('@')[0].split(':')[0] : myPhone;
+        const myLidNum = socket.user?.lid ? socket.user.lid.split('@')[0].split(':')[0] : '';
         const jidNum = jid.split('@')[0].split(':')[0];
-        const isSelfChat = Boolean((myPhone && jidNum === myPhone) || (myJidNum && jidNum === myJidNum) || jid.endsWith('@lid'));
 
-        // Jika fromMe tapi bukan self-chat ke nomor sendiri (misal owner chat manual ke orang lain), jangan balas
+        // Self-chat hanya jika pesan dikirim ke nomor/LID milik bot sendiri
+        const isSelfChat = Boolean(
+          (myPhone && jidNum === myPhone) ||
+          (myJidNum && jidNum === myJidNum) ||
+          (myLidNum && jidNum === myLidNum)
+        );
+
+        // Jika fromMe tapi bukan chat ke diri sendiri, abaikan (owner sedang chat manual ke orang lain)
         if (msg.key?.fromMe && !isSelfChat) continue;
 
         const id = jid + ':' + (msg.key?.id || '');
@@ -383,18 +390,17 @@ async function start() {
                || msg.message;
         const body = (m?.conversation || m?.extendedTextMessage?.text || m?.imageMessage?.caption || '').trim();
         if (!body) continue;
-        const text = body.slice(1500); // safety slice
         const safeText = body.slice(0, 1500);
 
         console.log(`[WA Chat] Pesan masuk dari ${jid}: "${safeText}"`);
 
-        // Target tujuan pengiriman balasan (normalisir @lid ke nomor sendiri jika self-chat)
-        const targetJid = jid.endsWith('@lid') && myPhone ? `${myPhone}@s.whatsapp.net` : jid;
+        // Selalu kirim balasan ke pengirim asli (baik JID nomor HP maupun Privacy LID)
+        const targetJid = jid;
 
         // Handler perintah reset
         if (/^\/(reset|hapus|mulaiulang)$/i.test(safeText)) {
           resetSession(jid);
-          const sent = await socket.sendMessage(targetJid, { text: 'Riwayat percakapan Nadia sudah direset, kak.' });
+          const sent = await socket.sendMessage(targetJid, { text: 'Riwayat percakapan Nadia sudah direset, kak.' }, { quoted: msg });
           if (sent?.key?.id) botSentIds.add(sent.key.id);
           continue;
         }
@@ -406,13 +412,13 @@ async function start() {
             const sent = await socket.sendMessage(targetJid, {
               image: { url: qrURL },
               caption: 'QRIS Bit & Bean (NMID: ID1025428743757). Setelah membayar, kirim bukti transfer/pembayaran agar admin dapat memverifikasi yaa kak 😊'
-            });
+            }, { quoted: msg });
             if (sent?.key?.id) botSentIds.add(sent.key.id);
           } catch (err) {
             console.warn('[WA] QRIS image failed:', err.message);
             const sent = await socket.sendMessage(targetJid, {
               text: 'QRIS Bit & Bean: ' + qrURL + '\nSilakan kirim bukti pembayaran kepada admin yaa kak.'
-            });
+            }, { quoted: msg });
             if (sent?.key?.id) botSentIds.add(sent.key.id);
           }
           continue;
@@ -422,7 +428,7 @@ async function start() {
         if (/^\/rekening$|\b(rekening|norek|nomor rekening|transfer bank)\b/i.test(safeText)) {
           const sent = await socket.sendMessage(targetJid, {
             text: 'Pembayaran transfer bank untuk tiga unit usaha:\n- BNI: 1048491406\n- SeaBank: 901187631820\n- BTN: 1001501017745\na.n. Nor Anisa.\n\nHarap kirimkan bukti transfer ke sini untuk konfirmasi admin ya kak 😊'
-          });
+          }, { quoted: msg });
           if (sent?.key?.id) botSentIds.add(sent.key.id);
           continue;
         }
@@ -449,7 +455,7 @@ async function start() {
           addMessage(jid, 'user', safeText);
           addMessage(jid, 'assistant', reply);
           console.log(`[WA Chat] Balasan dikirim ke ${targetJid}: "${reply.slice(0, 60)}..."`);
-          const sent = await socket.sendMessage(targetJid, { text: reply });
+          const sent = await socket.sendMessage(targetJid, { text: reply }, { quoted: msg });
           if (sent?.key?.id) botSentIds.add(sent.key.id);
         }
       } catch (err) {
