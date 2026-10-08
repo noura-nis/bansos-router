@@ -181,14 +181,20 @@ async function start() {
     for (const msg of messages || []) {
       try {
         const jid = msg.key?.remoteJid || '';
-        if (!jid || !jid.endsWith('@s.whatsapp.net')) continue;
+        if (!jid) continue;
 
-        // Cegah bot membalas pesannya sendiri
+        // Skip status broadcast & newsletter channels
+        if (jid === 'status@broadcast' || jid.endsWith('@newsletter')) continue;
+
+        console.log(`[WA] Pesan diterima (type: ${type}): id=${msg.key?.id} fromMe=${msg.key?.fromMe} jid=${jid}`);
+
+        // Jangan balas pesan yang dikirim oleh bot sendiri
         if (msg.key?.id && botSentIds.has(msg.key.id)) continue;
 
         const myPhone = String(process.env.WA_PHONE_NUMBER || '').replace(/[^0-9]/g, '');
+        const myJidNum = socket.user?.id ? socket.user.id.split('@')[0].split(':')[0] : myPhone;
         const jidNum = jid.split('@')[0].split(':')[0];
-        const isSelfChat = Boolean(myPhone && jidNum === myPhone);
+        const isSelfChat = Boolean((myPhone && jidNum === myPhone) || (myJidNum && jidNum === myJidNum) || jid.endsWith('@lid'));
 
         // Jika fromMe tapi bukan self-chat ke nomor sendiri (misal owner chat manual ke orang lain), jangan balas
         if (msg.key?.fromMe && !isSelfChat) continue;
@@ -204,10 +210,13 @@ async function start() {
                || msg.message?.documentWithCaptionMessage?.message
                || msg.message;
         const body = (m?.conversation || m?.extendedTextMessage?.text || m?.imageMessage?.caption || '').trim();
-        if (!body) continue;
+        if (!body) {
+          console.log(`[WA] Pesan tanpa teks diabaikan dari ${jid}`);
+          continue;
+        }
         const text = body.slice(0, 1500);
 
-        console.log(`[WA] Pesan masuk dari ${jid}: "${text}"`);
+        console.log(`[WA] Memproses pesan dari ${jid}: "${text}"`);
 
         if (/^\/(reset|hapus|mulaiulang)$/i.test(text)) {
           resetSession(jid);
@@ -247,7 +256,10 @@ async function start() {
         let reply = faq;
 
         if (!reply) {
-          if (now - (userLast.get(jid) || 0) < minUserInterval) continue;
+          if (now - (userLast.get(jid) || 0) < minUserInterval) {
+            console.log(`[WA] Cooldown aktif untuk ${jid}, lewati`);
+            continue;
+          }
           if (globalRequests.length >= maxPerMinute) {
             reply = 'Pesan sedang ramai. Silakan tunggu sebentar dan kirim kembali nanti.';
           } else {
