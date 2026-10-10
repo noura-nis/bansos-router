@@ -304,10 +304,11 @@ async function start() {
     logger,
     printQRInTerminal: false,
     syncFullHistory: false,
-    markOnlineOnConnect: false,
-    fireInitQueries: false,
+    markOnlineOnConnect: true,
+    fireInitQueries: true,
     defaultQueryTimeoutMs: 60000,
-    keepAliveIntervalMs: 25000
+    keepAliveIntervalMs: 15000,
+    getMessage: async (key) => undefined
   });
 
   socket.ev.on('creds.update', async () => {
@@ -342,6 +343,9 @@ async function start() {
       console.log('\n============================================================');
       console.log('[WA] 🎉 WHATSAPP BERHASIL TERHUBUNG & SIAP MENERIMA PESAN!');
       console.log('============================================================\n');
+      try {
+        await socket.sendPresenceUpdate('available');
+      } catch {}
       await updateStatus({ status: 'connected' });
       backupSessionToCloud();
     }
@@ -388,6 +392,7 @@ function extractMessageText(msg) {
 }
 
   socket.ev.on('messages.upsert', async ({ messages, type }) => {
+    console.log(`[WA Raw Event] messages.upsert: type=${type}, count=${messages?.length || 0}`);
     for (const msg of messages || []) {
       try {
         const jid = msg.key?.remoteJid || '';
@@ -400,6 +405,7 @@ function extractMessageText(msg) {
         if (msg.key?.id && botSentIds.has(msg.key.id)) continue;
 
         const rawText = extractMessageText(msg);
+        console.log(`[WA Raw Msg] from=${jid}, fromMe=${Boolean(msg.key?.fromMe)}, text="${rawText}"`);
         if (!rawText) continue;
         const safeText = rawText.slice(0, 1500);
 
@@ -425,7 +431,7 @@ function extractMessageText(msg) {
         if (!msg.key?.id || messageSeen.has(id)) continue;
         messageSeen.set(id, now);
 
-        console.log(`[WA Chat] Pesan diterima dari ${jid} (fromMe=${Boolean(msg.key?.fromMe)}): "${safeText}"`);
+        console.log(`[WA Chat] ✅ Memproses pesan dari ${jid}: "${safeText}"`);
 
         // Selalu kirim balasan ke pengirim asli (baik JID nomor HP maupun Privacy LID)
         const targetJid = jid;
