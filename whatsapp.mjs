@@ -372,18 +372,33 @@ async function start() {
 function extractMessageText(msg) {
   let m = msg.message;
   if (!m) return '';
-  if (m.deviceSentMessage?.message) m = m.deviceSentMessage.message;
-  if (m.ephemeralMessage?.message) m = m.ephemeralMessage.message;
-  if (m.viewOnceMessage?.message) m = m.viewOnceMessage.message;
-  if (m.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message;
-  if (m.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message;
-  if (m.editedMessage?.message) m = m.editedMessage.message;
+
+  while (
+    m.deviceSentMessage?.message ||
+    m.ephemeralMessage?.message ||
+    m.viewOnceMessage?.message ||
+    m.viewOnceMessageV2?.message ||
+    m.documentWithCaptionMessage?.message ||
+    m.protocolMessage?.editedMessage ||
+    m.editedMessage?.message
+  ) {
+    m = m.deviceSentMessage?.message ||
+        m.ephemeralMessage?.message ||
+        m.viewOnceMessage?.message ||
+        m.viewOnceMessageV2?.message ||
+        m.documentWithCaptionMessage?.message ||
+        m.protocolMessage?.editedMessage ||
+        m.editedMessage?.message;
+  }
 
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
     m.imageMessage?.caption ||
     m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    m.interactiveMessage?.body?.text ||
+    m.interactiveResponseMessage?.body?.text ||
     m.buttonsResponseMessage?.selectedDisplayText ||
     m.listResponseMessage?.title ||
     m.templateButtonReplyMessage?.selectedId ||
@@ -406,7 +421,13 @@ function extractMessageText(msg) {
 
         const rawText = extractMessageText(msg);
         console.log(`[WA Raw Msg] from=${jid}, fromMe=${Boolean(msg.key?.fromMe)}, text="${rawText}"`);
-        if (!rawText) continue;
+        if (!rawText) {
+          const keys = Object.keys(msg.message || {}).join(',');
+          if (keys && !keys.includes('protocolMessage') && !keys.includes('reactionMessage') && !keys.includes('senderKeyDistributionMessage')) {
+            console.log(`[WA Unparsed Msg] from=${jid}, keys=${keys}`);
+          }
+          continue;
+        }
         const safeText = rawText.slice(0, 1500);
 
         const myPhone = String(process.env.WA_PHONE_NUMBER || '').replace(/[^0-9]/g, '');
