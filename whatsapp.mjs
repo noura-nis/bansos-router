@@ -79,6 +79,8 @@ async function restoreSessionFromCloud() {
         await fs.mkdir(authDir, { recursive: true });
         let count = 0;
         for (const [fname, b64] of Object.entries(data.files)) {
+          // JANGAN restore file session-*.json yang sudah kadaluarsa (penyebab MessageCounterError)
+          if (fname.startsWith('session-')) continue;
           if (fname.endsWith('.json')) {
             await fs.writeFile(path.join(authDir, fname), Buffer.from(b64, 'base64'));
             count++;
@@ -116,6 +118,8 @@ function backupSessionToCloud() {
       const fileList = await fs.readdir(authDir);
       const files = {};
       for (const fname of fileList) {
+        // Jangan simpan file session-*.json ke backup cloud agar backup tetap ramping & bebas dari MessageCounterError
+        if (fname.startsWith('session-')) continue;
         if (fname.endsWith('.json')) {
           const full = path.join(authDir, fname);
           const buf = await fs.readFile(full);
@@ -280,6 +284,16 @@ async function start() {
   }
 
   await fs.mkdir(authDir, { recursive: true });
+
+  // Hapus file session-*.json kadaluarsa agar libsignal selalu membuat ratchet session yang sinkron (mencegah MessageCounterError)
+  try {
+    const localFiles = await fs.readdir(authDir);
+    for (const f of localFiles) {
+      if (f.startsWith('session-')) {
+        await fs.unlink(path.join(authDir, f)).catch(() => {});
+      }
+    }
+  } catch {}
 
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
