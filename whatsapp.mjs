@@ -351,6 +351,28 @@ async function start() {
     }
   });
 
+function extractMessageText(msg) {
+  let m = msg.message;
+  if (!m) return '';
+  if (m.deviceSentMessage?.message) m = m.deviceSentMessage.message;
+  if (m.ephemeralMessage?.message) m = m.ephemeralMessage.message;
+  if (m.viewOnceMessage?.message) m = m.viewOnceMessage.message;
+  if (m.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message;
+  if (m.documentWithCaptionMessage?.message) m = m.documentWithCaptionMessage.message;
+  if (m.editedMessage?.message) m = m.editedMessage.message;
+
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
+    m.templateButtonReplyMessage?.selectedId ||
+    ''
+  ).trim();
+}
+
   socket.ev.on('messages.upsert', async ({ messages, type }) => {
     for (const msg of messages || []) {
       try {
@@ -363,19 +385,24 @@ async function start() {
         // Jangan balas pesan yang dikirim oleh bot sendiri
         if (msg.key?.id && botSentIds.has(msg.key.id)) continue;
 
+        const rawText = extractMessageText(msg);
+        if (!rawText) continue;
+        const safeText = rawText.slice(0, 1500);
+
         const myPhone = String(process.env.WA_PHONE_NUMBER || '').replace(/[^0-9]/g, '');
         const myJidNum = socket.user?.id ? socket.user.id.split('@')[0].split(':')[0] : myPhone;
         const myLidNum = socket.user?.lid ? socket.user.lid.split('@')[0].split(':')[0] : '';
         const jidNum = jid.split('@')[0].split(':')[0];
 
-        // Self-chat hanya jika pesan dikirim ke nomor/LID milik bot sendiri
+        // Self-chat: jika user chatting ke nomor sendiri, atau di chat @lid pribadi (Message Yourself / tes bot)
         const isSelfChat = Boolean(
+          jid.endsWith('@lid') ||
           (myPhone && jidNum === myPhone) ||
           (myJidNum && jidNum === myJidNum) ||
           (myLidNum && jidNum === myLidNum)
         );
 
-        // Jika fromMe tapi bukan chat ke diri sendiri, abaikan (owner sedang chat manual ke orang lain)
+        // Jika fromMe tapi bukan chat ke diri sendiri (misal owner chat manual ke kontak lain di HP), jangan nimbrung
         if (msg.key?.fromMe && !isSelfChat) continue;
 
         const id = jid + ':' + (msg.key?.id || '');
@@ -384,15 +411,7 @@ async function start() {
         if (!msg.key?.id || messageSeen.has(id)) continue;
         messageSeen.set(id, now);
 
-        const m = msg.message?.ephemeralMessage?.message 
-               || msg.message?.viewOnceMessage?.message 
-               || msg.message?.documentWithCaptionMessage?.message
-               || msg.message;
-        const body = (m?.conversation || m?.extendedTextMessage?.text || m?.imageMessage?.caption || '').trim();
-        if (!body) continue;
-        const safeText = body.slice(0, 1500);
-
-        console.log(`[WA Chat] Pesan masuk dari ${jid}: "${safeText}"`);
+        console.log(`[WA Chat] Pesan diterima dari ${jid} (fromMe=${Boolean(msg.key?.fromMe)}): "${safeText}"`);
 
         // Selalu kirim balasan ke pengirim asli (baik JID nomor HP maupun Privacy LID)
         const targetJid = jid;
